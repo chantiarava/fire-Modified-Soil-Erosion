@@ -1,0 +1,197 @@
+// =====================================================
+//dNBR-based RUSLE Soil Erosion
+// Pre- and Post-Fire Conditions
+// =====================================================
+//
+// References:
+// Key & Benson (2006) – dNBR burn severity
+// Van der Knijff et al. (2000) – NDVI based C-factor
+// Wischmeier & Smith (1978) – RUSLE
+// =====================================================
+
+
+// -----------------------------------------------------
+// 1. PROJECTION & STUDY AREA
+// -----------------------------------------------------
+var utm43 = ee.Projection('EPSG:32643').atScale(30);
+var region = study_area.geometry();
+
+
+// -----------------------------------------------------
+// 2. LANDSAT 8 SR (NDWI masked)
+// -----------------------------------------------------
+function getL8(period){
+  var img = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(region)
+    .filterDate(period[0], period[1])
+    .sort('CLOUD_COVER')
+    .first()
+    .clip(region);
+
+  var sr = img.select(
+    ['SR_B3','SR_B4','SR_B5','SR_B7'],
+    ['green','red','nir','swir2']
+  ).multiply(0.0000275).add(-0.2)
+   .reproject({crs: utm43, scale: 30});
+
+  var ndwi = sr.normalizedDifference(['green','nir']);
+  return sr.updateMask(ndwi.lt(0));
+}
+
+var prePeriod  = ['2019-01-01','2019-01-31'];
+var postPeriod = ['2019-03-01','2019-03-31'];
+
+var L8_pre  = getL8(prePeriod);
+var L8_post = getL8(postPeriod);
+
+
+// -----------------------------------------------------
+// 3. NDVI & FCOVER
+// -----------------------------------------------------
+var NDVI = L8_pre.normalizedDifference(['nir','red']).rename('NDVI');
+
+function getFcover(ndvi){
+  var stats = ndvi.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: region,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  return ndvi.subtract(ee.Number(stats.get('NDVI_min')))
+    .divide(
+      ee.Number(stats.get('NDVI_max'))
+        .subtract(ee.Number(stats.get('NDVI_min')))
+    ).clamp(0,1);
+}
+
+var FCOVER = getFcover(NDVI);
+
+
+// -----------------------------------------------------
+// 4. C FACTOR – PRE FIRE
+// -----------------------------------------------------
+var C_pre = ee.Image(1).subtract(FCOVER).rename('C_pre');
+
+
+// -----------------------------------------------------
+// 5. dNBR CALCULATION
+// -----------------------------------------------------
+var NBR_pre  = L8_pre.normalizedDifference(['nir','swir2']);
+var NBR_post = L8_post.normalizedDifference(['nir','swir2']);
+
+var dNBR = NBR_pre.subtract(NBR_post).rename('dNBR');
+
+
+// -----------------------------------------------------
+// 6. NORMALIZE dNBR (0–1)
+// -----------------------------------------------------
+var dNBR_stats = dNBR.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: region,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+var dNBR_norm = dNBR
+  .subtract(ee.Number(dNBR_stats.get('dNBR_min')))
+  .divide(
+    ee.Number(dNBR_stats.get('dNBR_max'))
+      .subtract(ee.Number(dNBR_stats.get('dNBR_min')))
+  ).clamp(0,1)
+  .rename('dNBR_norm');
+
+
+// -----------------------------------------------------
+// 7. C FACTOR – POST FIRE (dNBR-based)
+// -----------------------------------------------------
+var C_post = C_pre.add(
+  dNBR_norm.multiply(
+    ee.Image(1).subtract(C_pre)
+  )
+).clamp(0,1).rename('C_post');
+
+
+// -----------------------------------------------------
+// 8. RUSLE FACTORS (R, K, LS, P)
+// -----------------------------------------------------
+var R = rainfall.multiply(0.363).add(79).rename('R');
+
+var soilTex = soil.select('b0');
+var K = ee.Image(0.02)
+  .where(soilTex.eq(1), 0.05)
+  .where(soilTex.eq(2), 0.045)
+  .where(soilTex.eq(3), 0.04)
+  .rename('K');
+
+var flowAccumulation = ee.Image('WWF/HydroSHEDS/15ACC').unmask(1);
+var slopeRad = slope.multiply(Math.PI).divide(180);
+
+var LS = flowAccumulation.multiply(30)
+  .divide(22.13).pow(0.4)
+  .multiply(slopeRad.sin().divide(0.0896).pow(1.3))
+  .rename('LS');
+
+var P = ee.Image(1);
+
+
+// -----------------------------------------------------
+// 9. SOIL LOSS
+// -----------------------------------------------------
+var A_pre  = R.multiply(K).multiply(LS).multiply(C_pre).multiply(P)
+  .rename('A_pre');
+
+var A_post = R.multiply(K).multiply(LS).multiply(C_post).multiply(P)
+  .rename('A_post');
+
+
+// -----------------------------------------------------
+// 10. VISUALIZATION
+// -----------------------------------------------------
+Map.centerObject(region, 9);
+
+Map.addLayer(C_pre,  {min:0, max:1, palette:['green','yellow','red']}, 'C_pre_dNBR');
+Map.addLayer(C_post, {min:0, max:1, palette:['green','yellow','red']}, 'C_post_dNBR');
+
+Map.addLayer(A_pre,  {min:0, max:50, palette:['yellow','red']}, 'A_pre_dNBR');
+Map.addLayer(A_post, {min:0, max:50, palette:['yellow','red']}, 'A_post_dNBR');
+
+
+// -----------------------------------------------------
+// 11. EXPORTS
+// -----------------------------------------------------
+Export.image.toDrive({
+  image: C_pre,
+  description: 'C_Pre_dNBR_UTM43_30m',
+  region: region,
+  scale: 30,
+  crs: 'EPSG:32643',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: C_post,
+  description: 'C_Post_dNBR_UTM43_30m',
+  region: region,
+  scale: 30,
+  crs: 'EPSG:32643',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: A_pre,
+  description: 'SoilLoss_PreFire_dNBR_RUSLE',
+  region: region,
+  scale: 30,
+  crs: 'EPSG:32643',
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: A_post,
+  description: 'SoilLoss_PostFire_dNBR_RUSLE',
+  region: region,
+  scale: 30,
+  crs: 'EPSG:32643',
+  maxPixels: 1e13
+});
